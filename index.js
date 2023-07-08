@@ -6,6 +6,10 @@ const joi = require('joi')  // import joi
 const {v4: uuidv4} = require('uuid')  // import uuid
 const sendGrid = require('@sendgrid/mail')  // import sendgrid
 sendGrid.setApiKey(process.env.SENDGRID_API_KEY);
+const bcrypt = require('bcrypt');
+const saltRounds = 10;
+const axios = require('axios')
+const authorization = require('./authorization')  // import authorization middleware
 
 let customerStore = [
     // {
@@ -36,7 +40,7 @@ app.get('/', (req, res) => {
     })
 })
 
-app.post('/register', (req, res) => {
+app.post('/register', async (req, res) => {
 
     const { lastname, firstname, email, phone, password } = req.body
 
@@ -58,7 +62,6 @@ app.post('/register', (req, res) => {
        return
     }
 
-
     const isEmailOrPhoneRegistered = customerStore.find(customer => customer.email === email || customer.phone === phone)   // check if email or phone is already registered
     if (isEmailOrPhoneRegistered) {
         res.status(400).json({
@@ -67,6 +70,24 @@ app.post('/register', (req, res) => {
         })
         return
     }
+    
+    const responseSalt = await bcrypt.genSalt(saltRounds)      // generate salt
+    if (!responseSalt) {
+        res.status(500).json({
+            status: false,
+            message: 'Sorry, we cannot create account at the moment. Please try again later.'
+        })
+        return
+    }
+    const responseHash = await bcrypt.hash(password, responseSalt)      // hash password
+    if (!responseHash) {            
+        res.status(500).json({
+            status: false,
+            message: 'Sorry, we cannot create account at the moment. Please try again later.'
+        })
+        return
+    }
+
 
     const customer = {
                 id: uuidv4(),
@@ -74,7 +95,7 @@ app.post('/register', (req, res) => {
                 firstname,
                 email,
                 phone,
-                password,
+                password: responseHash,
                 status: 'in-active',
                 registeredDate: new Date()
     }   
@@ -105,7 +126,7 @@ app.post('/register', (req, res) => {
 })
 
 
-app.get('/verify/:email/:otp', (req, res) => {
+app.get('/verify/:email/:otp', async(req, res) => {
     const { email, otp } = req.params
     if (!email || !otp) {                       // check if email or otp is not provided
         res.status(400).json({                  // return error response    
@@ -145,7 +166,7 @@ app.get('/verify/:email/:otp', (req, res) => {
     })
 
     customerStore = [...newCustomerStore]
-
+    sendEmail(email, 'Registration Successful', `Hi, we are happy to have you onboard. Let's do some awesome stuffs together`)   // send email to customer
     res.status(200).json({                      // return success response
         status: true,
         message: 'OTP verified successfully',
@@ -191,14 +212,202 @@ app.get('resend-otp/:email', (req, res) => {
 })
 
 
-app.get('/customers', (req, res) => {
+app.post('/login', async (req, res) => {
+
+    const { emailOrPhone, password } = req.body    
+
+    const loginSchema = joi.object({     // define login schema using joi
+        emailOrPhone: joi.string().required(),
+        password: joi.string().required()
+    }) 
+
+    const { value, error } = loginSchema.validate(req.body)   // validate request body
+    if (error != undefined) {                                                // check if there is an error  
+        res.status(400).json({                                              // return error response    
+            status: false,  
+            message: error.details[0].message
+        })
+        return
+    }
+
+    const customer = customerStore.find(data => data.email === emailOrPhone || data.phone === emailOrPhone)  // get customer
+    if (!customer) {                             // check if customer is not found
+        res.status(400).json({                   // return error response
+            status: false,
+            message: 'Invalid email or password'
+        })
+        return
+    }
+    
+    const responseHash = await bcrypt.hash(password, customer.salt)  // hash password with user salt
+    if (!responseHash) {                    // check if responseHash is not found
+        res.status(500).json({             // return error response
+            status: false,
+            message: 'Sorry, you cannot login this time. Please try again later'
+        })
+        return
+    }
+
+    if (responseHash !== customer.password) {  // check if responseHash is not equal to userHashWithUs
+        res.status(400).json({                 // return error response
+            status: false,
+            message: 'Invalid email or password'
+        })
+        return
+    }
+
+    if (customer.status !== 'active') {  // check if customer status is not active
+        res.status(400).json({                 // return error response
+            status: false,
+            message: 'Account not verified, kindly verify your account'
+        })
+        return
+    }
+
+    res.status(200).json({                      // return success response
+        status: true,
+        message: 'Login successful'
+    })
+})
+
+
+
+app.get('/jobs', async(req, res) => {
 
     const { apikey } = req.headers  // get apiKey from request headers
-    if (!apikey || apikey !== process.env.API_KEY ) {    // check if apiKey is not provided or is not equal to the one in the .env file
-        res.status(401).json({      // return error response
-            status: false,                                          
-            message: 'Unauthorized'
-        })  
+    const length = req.query.length  || 10  // get length from request query
+    const category = req.query.category || ''  // get category from request query
+    const company = req.query.company || ''  // get company from request query
+
+    const response = authorization(apikey)  // check if apiKey is valid
+    if (!response) {                 // check if apiKey is not valid
+        res.status(401).json({              // return error response
+            status: false,
+            message: 'Unathorisized'
+        })
+        return
+    }
+
+    const result =await axios({
+        method:  "get",
+        url: `${process.env.REMOTE_API_BASEURL}/remote-jobs?limit=${length}&category=${category}&company_name=${company}`
+    })           
+
+    res.status(200).json({                      // return success response
+        status: true,
+        count: result.data.jobs.length,
+        data: result.data.jobs
+    })
+   
+    
+    // fetch('https://remotive.com/api/remote-jobs')  // fetch jobs from remotive api
+    // .then(response => response.json())
+    // .then(data => {
+    //     res.status(200).json({                      // return success response
+    //         status: true,
+    //         data: data.jobs
+    //     })
+    // })
+
+})
+
+
+app.get('/jobs/categories', async(req, res) => {
+    
+    const result = await axios({
+        method: "get",
+        url: `${process.env.REMOTE_API_BASEURL}/remote-jobs`
+    })
+
+    
+    // const response1 = await axios({
+    //     method: "get",
+    //     url: "https://remotive.com/api/remote-jobs",
+    // })
+
+    const jobCategories = result.data.jobs.map(item => item.category)
+
+   res.status(200).json({                      // return success response
+        status: true,
+        data: jobCategories
+   })
+
+
+
+
+
+    
+
+
+})
+    
+
+
+
+
+
+
+
+
+
+
+app.post('/job/apply', (req, res) => {
+    const applySchema = joi.object({     // define apply schema using joi
+        fullname: joi.string().required().min(4),
+        address: joi.string().required().min(10),
+        email: joi.string().required().email(),
+        jobId: joi.string().required(),
+        yearsOfExperience: joi.number().required(),
+        qualifications: joi.string().required().valid('SSCE', 'BSC', 'MSC')
+    })
+
+    const { value, error } = applySchema.validate(req.body)   // validate request body
+    if (error !== undefined) {                                                // check if there is an error
+        res.status(400).json({                                              // return error response
+            status: false,
+            message: error.details[0].message
+        })
+        return
+    }
+
+
+    const { fullname, address, email, jobId, yearsOfExperience, qualifications } = req.body  // get request body
+    const job = {
+        id: uuidv4(),
+        fullname,
+        address,
+        email,
+        jobId,
+        yearsOfExperience,
+        qualifications,
+        status: 'submitted',
+        date: new Date()
+    }
+
+    jobApplicationStore.push(job)  // add job to jobApplicationStore
+    
+    res.status(200).json({          // return success response
+        status: true,
+        message: 'Job application submitted successfully'
+
+    })
+})
+
+const jobApplicationStore = []
+
+
+
+
+
+app.get('/admin/customers', (req, res) => {
+
+    const { apikey } = req.headers  // get apiKey from request headers
+    const response = authorization(apikey)  // check if apiKey is valid
+    if (!response) {                 // check if apiKey is not valid
+        res.status(401).json({              // return error response
+            status: false,
+            message: 'Unathorisized'
+        })
         return
     }
 
@@ -230,6 +439,8 @@ sendGrid
     .catch((error) => { })                     // return error response   
 
 }
+
+
 
 
 
